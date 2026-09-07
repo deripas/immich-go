@@ -80,6 +80,8 @@ func (client *Client) Open(ctx context.Context, app *Application) error {
 		}
 	}
 
+	client.app = app
+
 	// Plug the journal on the Log
 	log := app.Log()
 	if log.File != "" {

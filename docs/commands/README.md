@@ -15,6 +15,7 @@ immich-go [global-options] command sub-command [command-options] [path]
 | [upload](upload.md) | Upload photos/videos to Immich server | from-folder, from-google-photos, from-icloud, from-picasa, from-immich |
 | [archive](archive.md) | Export/archive photos to local folder structure | from-folder, from-google-photos, from-icloud, from-picasa, from-immich |
 | [stack](stack.md) | Organize related photos into stacks on server | (none) |
+| [replace](replace.md) | Replace an asset's file, keeping its metadata | (none) |
 | version | Display version information | (none) |
 
 ## Global Options
@@ -64,3 +65,4 @@ immich-go version
 - [Upload Command](upload.md) - Comprehensive upload options and sub-commands
 - [Archive Command](archive.md) - Export and archival features  
 - [Stack Command](stack.md) - Photo organization and stacking
+- [Replace Command](replace.md) - Swap an asset's file while keeping its metadata
