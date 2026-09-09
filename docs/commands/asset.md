@@ -5,6 +5,7 @@ The `asset` command works on a single asset of the server, designated by its ID.
 ## Syntax
 
 ```bash
+immich-go asset list    [filters] [options]
 immich-go asset show    --asset=<asset-id> [options]
 immich-go asset clone   --asset=<asset-id> [options] <file>
 immich-go asset replace --asset=<asset-id> [options] <file>
@@ -14,6 +15,7 @@ immich-go asset replace --asset=<asset-id> [options] <file>
 
 | Sub-command | Description |
 | ----------- | ----------- |
+| `list`      | List the assets matching a set of filters, optionally as a CSV |
 | `show`      | Print the metadata the server holds for an asset |
 | `clone`     | Upload a file and give it the metadata of an existing asset, leaving the source untouched |
 | `replace`   | The same, then move the source asset to the trash |
@@ -37,13 +39,46 @@ Start with `clone --stack`: both assets end up side by side in the web interface
 
 ## Required Options
 
-| Option          | Required | Description                |
-| --------------- | :------: | -------------------------- |
-| `-s, --server`  |    Y     | Immich server URL          |
-| `-k, --api-key` |    Y     | Your API key               |
-| `--asset`       |    Y     | ID of the asset to work on |
+| Option          | Required        | Description                |
+| --------------- | :-------------: | -------------------------- |
+| `-s, --server`  |        Y        | Immich server URL          |
+| `-k, --api-key` |        Y        | Your API key               |
+| `--asset`       | show, clone, replace | ID of the asset to work on |
 
 `clone` and `replace` need an API key with the `asset.copy` permission, on top of the usual upload and delete ones.
+
+## Selecting assets with `list`
+
+`list` takes the filters of `upload from-immich`, with the same names and meaning:
+`--from-tags`, `--from-albums`, `--from-make`, `--from-model`, `--from-country`,
+`--from-state`, `--from-city`, `--from-archived`, `--from-favorite`, `--from-trash`,
+`--from-no-album`, `--from-minimal-rating`, `--from-partners`, `--date-range` and
+`--include-type`.
+
+The report goes to the terminal, sorted by capture date. `--export=<file.csv>` also
+writes it as a CSV. The command refuses to overwrite an existing export, because it
+is meant to be filled in by hand afterwards.
+
+| Column                        | Description |
+| ----------------------------- | ----------- |
+| `id`                          | Asset ID, what `clone` and `replace` take as `--asset` |
+| `name`, `type`                | Original file name, `IMAGE` or `VIDEO` |
+| `capture_date`                | The date shown in the properties panel, with the offset it was shot at |
+| `timeline_date`               | The date the asset is grouped on in the timeline |
+| `width`, `height`, `size`     | Dimensions and file size in bytes |
+| `checksum`                    | Lets a second run tell which rows are already done |
+| `server_path`                 | Where the file sits in the server's storage |
+| `new_file`                    | Empty, to be filled with the path of the converted file |
+
+The two dates are exported separately on purpose: they disagree whenever the capture
+date was edited after the server extracted the metadata of the file, and that is
+worth spotting before running a batch.
+
+`server_path` is the path as the **server** sees it, which inside a container looks
+like `/usr/src/app/upload/...`. If the Immich folder is mounted here, rewrite it with
+`--server-path-prefix` and `--local-path-prefix`, and `ffmpeg` can read the column
+directly. The two go together, and a path outside the given prefix — an external
+library — is reported unchanged.
 
 ## Behavior Options
 
@@ -85,6 +120,12 @@ If the date still looks wrong, check it with `immich-go asset show`: it prints t
 ## Examples
 
 ```bash
+# Select the stereoscopic videos and write a conversion plan
+immich-go asset list --server=http://localhost:2283 --api-key=your-key \
+  --from-tags=3d --include-type=VIDEO \
+  --server-path-prefix=/usr/src/app/upload --local-path-prefix=/mnt/tank/immich \
+  --export=./work/plan.csv
+
 # What does the server hold for this asset?
 immich-go asset show --server=http://localhost:2283 --api-key=your-key --asset=6f3a1b2c-...
 

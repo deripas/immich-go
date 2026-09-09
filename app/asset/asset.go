@@ -53,6 +53,7 @@ func NewAssetCommand(ctx context.Context, a *app.Application) *cobra.Command {
 
 	cmd.AddCommand(
 		newShowCommand(ctx, a),
+		newListCommand(ctx, a),
 		newCloneCommand(ctx, a),
 		newReplaceCommand(ctx, a),
 	)
