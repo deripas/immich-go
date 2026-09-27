@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
+	"text/tabwriter"
 
 	"github.com/simulot/immich-go/app"
 	"github.com/simulot/immich-go/immich"
@@ -29,19 +31,24 @@ type swapCmd struct {
 
 	FileName    string // Name given to the server, defaults to the local file name
 	Stack       bool   // Stack the new asset with the source one
+	FromCSV     string // Work on the rows of this plan instead of a single asset
+	Result      string // Write the outcome of a plan as a CSV file
 	trashSource bool   // Set by "replace", not a flag
 }
 
 func newCloneCommand(ctx context.Context, a *app.Application) *cobra.Command {
 	cmd := &cobra.Command{
-		Use:   "clone <file> [flags]",
+		Use:   "clone [<file>] [flags]",
 		Short: "Upload a file and give it the metadata of an existing asset",
 		Long: `Upload a local file and carry the metadata of an existing asset over to it.
 
 The source asset is left untouched, so both can be compared in the web interface.
 Use --stack to have the server show them together. Use "asset replace" to do the
-same and move the source asset to the trash.`,
-		Args: cobra.ExactArgs(1),
+same and move the source asset to the trash.
+
+Give --asset and a file to work on a single asset, or --from-csv to work on a plan
+exported by "asset list" and filled in with the converted files.`,
+		Args: cobra.MaximumNArgs(1),
 	}
 
 	sc := &swapCmd{assetCmd: assetCmd{app: a}}
@@ -49,14 +56,14 @@ same and move the source asset to the trash.`,
 	cmd.Flags().BoolVar(&sc.Stack, "stack", false, "Stack the new asset with the source one, to compare them side by side")
 
 	cmd.RunE = func(cmd *cobra.Command, args []string) error { //nolint:contextcheck
-		return sc.run(cmd.Context(), a, args[0])
+		return sc.run(cmd.Context(), a, args)
 	}
 	return cmd
 }
 
 func newReplaceCommand(ctx context.Context, a *app.Application) *cobra.Command {
 	cmd := &cobra.Command{
-		Use:   "replace <file> [flags]",
+		Use:   "replace [<file>] [flags]",
 		Short: "Replace the file of an existing asset, keeping its metadata",
 		Long: `Replace the file of an existing asset by a local file.
 
@@ -66,30 +73,71 @@ and the replaced asset is moved to the trash. Use "asset clone" to keep it.
 Albums, stack, shared links, sidecar and the favorite flag are copied by the server.
 The capture date, the description, the rating, the GPS coordinates and the tags are
 copied by immich-go, because the server doesn't. Faces aren't carried over: the
-server runs its recognition again on the new file.`,
-		Args: cobra.ExactArgs(1),
+server runs its recognition again on the new file.
+
+Give --asset and a file to work on a single asset, or --from-csv to work on a plan
+exported by "asset list" and filled in with the converted files.`,
+		Args: cobra.MaximumNArgs(1),
 	}
 
 	sc := &swapCmd{assetCmd: assetCmd{app: a}, trashSource: true}
 	sc.registerFlags(cmd)
 
 	cmd.RunE = func(cmd *cobra.Command, args []string) error { //nolint:contextcheck
-		return sc.run(cmd.Context(), a, args[0])
+		return sc.run(cmd.Context(), a, args)
 	}
 	return cmd
 }
 
 func (sc *swapCmd) registerFlags(cmd *cobra.Command) {
 	sc.registerCommonFlags(cmd)
-	cmd.Flags().StringVar(&sc.FileName, "filename", "", "Original file name to give to the server (default: the local file name)")
+	flags := cmd.Flags()
+	flags.StringVar(&sc.FileName, "filename", "", "Original file name to give to the server (default: the local file name)")
+	flags.StringVar(&sc.FromCSV, "from-csv", "", "Work on every row of this plan, reading the id and new_file columns")
+	flags.StringVar(&sc.Result, "result", "", "Write the outcome of the plan as a CSV file at this path")
 }
 
-func (sc *swapCmd) run(ctx context.Context, a *app.Application, fileName string) error {
+func (sc *swapCmd) run(ctx context.Context, a *app.Application, args []string) error {
+	if err := sc.validate(args); err != nil {
+		return err
+	}
 	if err := sc.client.Open(ctx, a); err != nil {
 		return err
 	}
 	defer sc.client.Close() //nolint:errcheck
 
+	if sc.FromCSV != "" {
+		return sc.runPlan(ctx)
+	}
+	return sc.runOne(ctx, args[0])
+}
+
+func (sc *swapCmd) validate(args []string) error {
+	switch {
+	case sc.FromCSV == "" && (sc.AssetID == "" || len(args) == 0):
+		return fmt.Errorf("give --asset and a file to work on a single asset, or --from-csv to work on a plan")
+	case sc.FromCSV != "" && (sc.AssetID != "" || len(args) > 0):
+		return fmt.Errorf("--from-csv carries the assets and the files, don't pass --asset or a file as well")
+	case sc.FromCSV == "" && sc.Result != "":
+		return fmt.Errorf("--result reports on a plan, it goes with --from-csv")
+	}
+	if sc.FromCSV != "" {
+		// Fail on a missing plan before opening a connection.
+		if _, err := os.Stat(sc.FromCSV); err != nil {
+			return err
+		}
+	}
+	if sc.Result != "" {
+		// The result is the record of what happened, don't lose a previous one.
+		if _, err := os.Stat(sc.Result); err == nil {
+			return fmt.Errorf("%s exists already, remove it or write the result to another path", sc.Result)
+		}
+	}
+	return nil
+}
+
+// runOne works on the single asset given on the command line.
+func (sc *swapCmd) runOne(ctx context.Context, fileName string) error {
 	source, err := sc.load(ctx)
 	if err != nil {
 		return fmt.Errorf("can't get the asset %s: %w", sc.AssetID, err)
@@ -97,10 +145,133 @@ func (sc *swapCmd) run(ctx context.Context, a *app.Application, fileName string)
 	if source.IsTrashed {
 		return fmt.Errorf("the asset %s is in the trash, restore it before using it as a source", source.ID)
 	}
+	if err = checkFile(fileName, sc.client.Immich.SupportedMedia()); err != nil {
+		return err
+	}
 
-	newAsset, cleanup, err := sc.prepare(source, fileName)
+	_, err = sc.processOne(ctx, source, fileName, sc.FileName, true)
+	return err
+}
+
+// runPlan works on every row of a CSV plan.
+//
+// The plan is checked as a whole before anything is uploaded: a typo on the last
+// row is worth knowing about before the first asset has been replaced.
+func (sc *swapCmd) runPlan(ctx context.Context) error {
+	log := sc.app.Log()
+
+	rows, err := readPlan(sc.FromCSV)
 	if err != nil {
 		return err
+	}
+	if err = sc.checkPlan(ctx, rows); err != nil {
+		return err
+	}
+	sc.reportPlan(rows)
+
+	results := make([]planResult, 0, len(rows))
+	var stopped error
+	for i, row := range rows {
+		log.Message("[%d/%d] %s (%s) <- %s", i+1, len(rows), row.source.OriginalFileName, row.assetID, row.file)
+
+		newID, err := sc.processOne(ctx, row.source, row.file, row.filename, false)
+		results = append(results, planResult{row: row, newID: newID, err: err})
+
+		if err != nil {
+			// --on-errors decides whether one bad row ends the run.
+			if stop := sc.app.ProcessError(fmt.Errorf("%s line %d: %w", sc.FromCSV, row.line, err)); stop != nil {
+				stopped = stop
+				break
+			}
+		}
+	}
+
+	done, failed := 0, 0
+	for _, r := range results {
+		if r.err != nil {
+			failed++
+		} else {
+			done++
+		}
+	}
+	verb := "cloned"
+	if sc.trashSource {
+		verb = "replaced"
+	}
+	log.Message("%d asset(s) %s, %d failed, %d not attempted", done, verb, failed, len(rows)-len(results))
+
+	if sc.Result != "" {
+		if err = writeResults(sc.Result, results); err != nil {
+			return err
+		}
+		log.Message("Wrote %s", sc.Result)
+	}
+	return stopped
+}
+
+// checkPlan resolves every row against the file system and the server, so that the
+// run either starts on solid ground or doesn't start at all.
+func (sc *swapCmd) checkPlan(ctx context.Context, rows []*planRow) error {
+	sm := sc.client.Immich.SupportedMedia()
+	problems := []string{}
+
+	for _, row := range rows {
+		if err := checkFile(row.file, sm); err != nil {
+			problems = append(problems, fmt.Sprintf("line %d: %v", row.line, err))
+			continue
+		}
+
+		source, err := sc.client.Immich.GetAssetInfo(ctx, row.assetID)
+		if err != nil {
+			problems = append(problems, fmt.Sprintf("line %d: can't get the asset %s: %v", row.line, row.assetID, err))
+			continue
+		}
+		if source.IsTrashed {
+			problems = append(problems, fmt.Sprintf("line %d: the asset %s is in the trash", row.line, row.assetID))
+			continue
+		}
+		source.Albums, err = sc.client.Immich.GetAssetAlbums(ctx, source.ID)
+		if err != nil {
+			problems = append(problems, fmt.Sprintf("line %d: can't get the albums of %s: %v", row.line, row.assetID, err))
+			continue
+		}
+		row.source = source
+	}
+
+	if len(problems) > 0 {
+		return fmt.Errorf("%s doesn't check out, nothing was uploaded:\n  %s", sc.FromCSV, strings.Join(problems, "\n  "))
+	}
+	return nil
+}
+
+func (sc *swapCmd) reportPlan(rows []*planRow) {
+	log := sc.app.Log()
+
+	var b strings.Builder
+	w := tabwriter.NewWriter(&b, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(w, "#\tID\tCURRENT NAME\tNEW FILE")
+	for i, row := range rows {
+		fmt.Fprintf(w, "%d\t%s\t%s\t%s\n", i+1, row.assetID, row.source.OriginalFileName, row.file)
+	}
+	_ = w.Flush()
+	for line := range strings.SplitSeq(strings.TrimRight(b.String(), "\n"), "\n") {
+		log.Message("%s", line)
+	}
+
+	if sc.trashSource {
+		log.Message("%d asset(s) to replace, the source of each one goes to the trash.", len(rows))
+	} else {
+		log.Message("%d asset(s) to clone, every source is left untouched.", len(rows))
+	}
+}
+
+// processOne uploads fileName in place of source. detailed asks for the full
+// metadata block, which is worth printing for a single asset but not for a plan of
+// a hundred.
+func (sc *swapCmd) processOne(ctx context.Context, source *immich.Asset, fileName, overrideName string, detailed bool) (string, error) {
+	newAsset, cleanup, err := sc.prepare(source, fileName, overrideName)
+	if err != nil {
+		return "", err
 	}
 	defer cleanup()
 	defer newAsset.Close() //nolint:errcheck
@@ -109,49 +280,71 @@ func (sc *swapCmd) run(ctx context.Context, a *app.Application, fileName string)
 	// at all, and it makes the dry-run report meaningful.
 	checksum, err := newAsset.GetChecksum()
 	if err != nil {
-		return fmt.Errorf("can't read %s: %w", fileName, err)
+		return "", fmt.Errorf("can't read %s: %w", fileName, err)
 	}
 
-	sc.report(source, newAsset)
+	if detailed {
+		sc.report(source, newAsset)
+	}
 
 	onServer, err := sc.client.Immich.GetAssetsByHash(ctx, checksum)
 	if err != nil {
-		return fmt.Errorf("can't check whether %s is already on the server: %w", fileName, err)
+		return "", fmt.Errorf("can't check whether %s is already on the server: %w", fileName, err)
 	}
 	for _, other := range onServer {
 		if other.ID == source.ID {
-			return fmt.Errorf("%s is the file of the asset %s already, nothing to do", fileName, source.ID)
+			return "", fmt.Errorf("%s is the file of the asset %s already, nothing to do", fileName, source.ID)
 		}
-		return fmt.Errorf("%s is already on the server as the asset %s (%s)", fileName, other.ID, other.OriginalFileName)
+		return "", fmt.Errorf("%s is already on the server as the asset %s (%s)", fileName, other.ID, other.OriginalFileName)
 	}
 
-	return sc.swap(ctx, source, newAsset)
+	if err = sc.swap(ctx, source, newAsset); err != nil {
+		return newAsset.ID, err
+	}
+	return newAsset.ID, nil
+}
+
+// checkFile makes sure a path points at a file the server would accept.
+func checkFile(fileName string, sm filetypes.SupportedMedia) error {
+	st, err := os.Stat(fileName)
+	if err != nil {
+		return err
+	}
+	if st.IsDir() {
+		return fmt.Errorf("%s is a directory", fileName)
+	}
+	if t := sm.TypeFromName(filepath.Base(fileName)); t != filetypes.TypeImage && t != filetypes.TypeVideo {
+		return fmt.Errorf("the file %q isn't a media type supported by the server", filepath.Base(fileName))
+	}
+	return nil
 }
 
 // prepare builds the asset to be uploaded, seeded with the metadata of the source
 // asset. A transcoder output carries none of it, so everything the server should
 // keep has to be put back explicitly.
-func (sc *swapCmd) prepare(source *immich.Asset, fileName string) (*assets.Asset, func(), error) {
+func (sc *swapCmd) prepare(source *immich.Asset, fileName, overrideName string) (*assets.Asset, func(), error) {
 	noCleanup := func() {}
 
 	name, err := filepath.Abs(fileName)
 	if err != nil {
 		return nil, noCleanup, err
 	}
+	sm := sc.client.Immich.SupportedMedia()
+	if err = checkFile(name, sm); err != nil {
+		return nil, noCleanup, err
+	}
 	st, err := os.Stat(name)
 	if err != nil {
 		return nil, noCleanup, err
 	}
-	if st.IsDir() {
-		return nil, noCleanup, fmt.Errorf("%s is a directory", fileName)
-	}
 
 	originalFileName := filepath.Base(name)
-	if sc.FileName != "" {
-		originalFileName = sc.FileName
-	}
-	if t := sc.client.Immich.SupportedMedia().TypeFromName(originalFileName); t != filetypes.TypeImage && t != filetypes.TypeVideo {
-		return nil, noCleanup, fmt.Errorf("the file %q isn't a media type supported by the server", originalFileName)
+	if overrideName != "" {
+		originalFileName = overrideName
+		// The name given to the server drives the type it stores the asset as.
+		if t := sm.TypeFromName(originalFileName); t != filetypes.TypeImage && t != filetypes.TypeVideo {
+			return nil, noCleanup, fmt.Errorf("the name %q isn't a media type supported by the server", originalFileName)
+		}
 	}
 
 	captureDate := captureDateOf(source)

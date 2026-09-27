@@ -22,6 +22,7 @@ when the capture date is edited afterwards.`,
 
 	sc := &assetCmd{app: a}
 	sc.registerCommonFlags(cmd)
+	_ = cmd.MarkFlagRequired("asset")
 
 	cmd.RunE = func(cmd *cobra.Command, args []string) error { //nolint:contextcheck
 		ctx := cmd.Context()

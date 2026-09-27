@@ -27,7 +27,6 @@ func (ac *assetCmd) registerCommonFlags(cmd *cobra.Command) {
 	flags := cmd.Flags()
 	flags.StringVar(&ac.AssetID, "asset", "", "ID of the asset to work on")
 	ac.client.RegisterFlags(flags, "")
-	_ = cmd.MarkFlagRequired("asset")
 	cmd.TraverseChildren = true
 }
 

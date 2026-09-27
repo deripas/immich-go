@@ -9,6 +9,8 @@ immich-go asset list    [filters] [options]
 immich-go asset show    --asset=<asset-id> [options]
 immich-go asset clone   --asset=<asset-id> [options] <file>
 immich-go asset replace --asset=<asset-id> [options] <file>
+immich-go asset clone   --from-csv=<plan.csv> [options]
+immich-go asset replace --from-csv=<plan.csv> [options]
 ```
 
 ## Sub-commands
@@ -43,7 +45,7 @@ Start with `clone --stack`: both assets end up side by side in the web interface
 | --------------- | :-------------: | -------------------------- |
 | `-s, --server`  |        Y        | Immich server URL          |
 | `-k, --api-key` |        Y        | Your API key               |
-| `--asset`       | show, clone, replace | ID of the asset to work on |
+| `--asset`       | show, clone, replace | ID of the asset to work on, unless `--from-csv` is given |
 
 `clone` and `replace` need an API key with the `asset.copy` permission, on top of the usual upload and delete ones.
 
@@ -87,6 +89,40 @@ library — is reported unchanged.
 | `--dry-run`  | all             | `false`         | Report what would be done without changing the server |
 | `--filename` | clone, replace  | Local file name | Original file name to give to the server              |
 | `--stack`    | clone           | `false`         | Stack the new asset with the source one               |
+| `--from-csv` | clone, replace  | —               | Work on every row of a plan instead of a single asset |
+| `--result`   | clone, replace  | —               | Write the outcome of the plan as a CSV                |
+
+## Working on a batch with `--from-csv`
+
+`--from-csv` takes the file `asset list --export` produced, with the `new_file`
+column filled in:
+
+```
+id,name,type,capture_date,timeline_date,width,height,size,checksum,server_path,new_file
+6f3a…,stereo.mp4,VIDEO,2013-05-04T10:00:00+02:00,…,/mnt/tank/immich/…/stereo.mp4,./out/stereo_left.mp4
+```
+
+Only `id` and `new_file` are read, by column name, so the order doesn't matter and
+every other column is ignored. An optional `filename` column overrides, per row, the
+name given to the server. Relative paths in `new_file` are resolved against the
+current directory.
+
+A row with an empty `new_file` is **skipped**, not an error: clearing the cells of
+the rows to leave alone is how a subset gets processed.
+
+The plan is checked as a whole before anything is uploaded — every file exists and
+is a supported type, every ID resolves to an asset that isn't in the trash, and no
+asset or file appears twice. A typo on the last row is worth knowing about before
+the first asset has been replaced.
+
+Rows are then processed one at a time, in order. `--on-errors` decides what a failed
+row does to the run: `stop` (the default) ends it, `continue` carries on, a number
+allows that many failures. `--result=<file.csv>` records what happened as
+`id,new_id,new_file,status,error`, which is what a retry run is built from — filter
+the failed rows and feed them back. Like `--export`, it refuses to overwrite.
+
+`--dry-run` runs the whole thing without writing: the plan is validated, the files
+are hashed and checked against the server, and nothing is uploaded or trashed.
 
 ## What is carried over
 
@@ -137,6 +173,17 @@ immich-go asset clone --server=http://localhost:2283 --api-key=your-key \
 # Happy with the result: do it for real
 immich-go asset replace --server=http://localhost:2283 --api-key=your-key \
   --asset=6f3a1b2c-... left-eye.mp4
+
+# Convert a whole batch, then apply it
+tail -n +2 ./work/plan.csv | while IFS=, read -r id name type cap tl w h size sum src new; do
+  out="./work/out/${name%.*}_left.${name##*.}"
+  ffmpeg -i "$src" -vf "crop=iw/2:ih:0:0" -c:a copy "$out"
+done
+# fill the new_file column with those paths, then:
+immich-go asset replace --server=http://localhost:2283 --api-key=your-key \
+  --from-csv=./work/plan.csv --dry-run
+immich-go asset replace --server=http://localhost:2283 --api-key=your-key \
+  --from-csv=./work/plan.csv --on-errors=continue --result=./work/result.csv
 
 # Re-encode to H.265, keeping the name the asset has on the server
 ffmpeg -i input.mp4 -c:v libx265 -crf 28 -c:a copy output.mp4
