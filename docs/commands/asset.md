@@ -110,16 +110,32 @@ current directory.
 A row with an empty `new_file` is **skipped**, not an error: clearing the cells of
 the rows to leave alone is how a subset gets processed.
 
-The plan is checked as a whole before anything is uploaded — every file exists and
-is a supported type, every ID resolves to an asset that isn't in the trash, and no
-asset or file appears twice. A typo on the last row is worth knowing about before
-the first asset has been replaced.
+The plan is checked as a whole before anything is uploaded — every ID resolves,
+every file still to be uploaded exists and is a supported type, and no asset or file
+appears twice. A typo on the last row is worth knowing about before the first asset
+has been replaced.
+
+### Re-running a plan
+
+A plan stays usable after a partial run. Two cases are reported as **skipped**
+rather than as failures, so the rest of the plan goes through:
+
+- the source asset is in the trash, which means it was replaced already, by an
+  earlier run or by hand;
+- the converted file is already on the server, under the source asset or under a new
+  one.
+
+Those rows are decided before their file is looked at, so deleting the converted
+files of the rows that are already done doesn't hold the plan back.
 
 Rows are then processed one at a time, in order. `--on-errors` decides what a failed
 row does to the run: `stop` (the default) ends it, `continue` carries on, a number
-allows that many failures. `--result=<file.csv>` records what happened as
-`id,new_id,new_file,status,error`, which is what a retry run is built from — filter
-the failed rows and feed them back. Like `--export`, it refuses to overwrite.
+allows that many failures. Skipped rows are not failures and never stop a run.
+
+`--result=<file.csv>` records what happened as `id,new_id,new_file,status,detail`,
+with `status` one of `ok`, `skipped` or `failed`. It is what a retry run is built
+from — filter the failed rows and feed them back. Like `--export`, it refuses to
+overwrite an existing file.
 
 `--dry-run` runs the whole thing without writing: the plan is validated, the files
 are hashed and checked against the server, and nothing is uploaded or trashed.

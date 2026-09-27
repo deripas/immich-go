@@ -28,6 +28,7 @@ type planRow struct {
 	filename string // Optional per-row override of the name given to the server
 
 	source *immich.Asset // Filled once the row is checked against the server
+	skip   string        // Non-empty when the check found nothing to do for this row
 }
 
 // readPlan reads the rows to work on. Columns are looked up by name, so the order
@@ -124,12 +125,13 @@ func readPlan(path string) ([]*planRow, error) {
 
 // planResult is what happened to one row, reported back as a CSV.
 type planResult struct {
-	row   *planRow
-	newID string
-	err   error
+	row     *planRow
+	newID   string
+	skipped string // Non-empty when the row needed nothing done, with the reason
+	err     error
 }
 
-var resultColumns = []string{"id", "new_id", "new_file", "status", "error"}
+var resultColumns = []string{"id", "new_id", "new_file", "status", "detail"}
 
 func writeResults(path string, results []planResult) error {
 	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
@@ -144,8 +146,11 @@ func writeResults(path string, results []planResult) error {
 	}
 	for _, r := range results {
 		status, message := "ok", ""
-		if r.err != nil {
+		switch {
+		case r.err != nil:
 			status, message = "failed", r.err.Error()
+		case r.skipped != "":
+			status, message = "skipped", r.skipped
 		}
 		if err = w.Write([]string{r.row.assetID, r.newID, r.row.file, status, message}); err != nil {
 			return err

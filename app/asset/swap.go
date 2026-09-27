@@ -2,6 +2,7 @@ package asset
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -172,11 +173,26 @@ func (sc *swapCmd) runPlan(ctx context.Context) error {
 	results := make([]planResult, 0, len(rows))
 	var stopped error
 	for i, row := range rows {
+		if row.skip != "" {
+			log.Message("[%d/%d] %s (%s) skipped: %s", i+1, len(rows), row.source.OriginalFileName, row.assetID, row.skip)
+			results = append(results, planResult{row: row, skipped: row.skip})
+			continue
+		}
+
 		log.Message("[%d/%d] %s (%s) <- %s", i+1, len(rows), row.source.OriginalFileName, row.assetID, row.file)
 
 		newID, err := sc.processOne(ctx, row.source, row.file, row.filename, false)
-		results = append(results, planResult{row: row, newID: newID, err: err})
 
+		// A row that needs nothing done to it is not a failure: re-running a plan
+		// that was partly applied is the normal way to finish it.
+		var nothing nothingToDo
+		if errors.As(err, &nothing) {
+			log.Message("        skipped: %s", nothing.reason)
+			results = append(results, planResult{row: row, newID: newID, skipped: nothing.reason})
+			continue
+		}
+
+		results = append(results, planResult{row: row, newID: newID, err: err})
 		if err != nil {
 			// --on-errors decides whether one bad row ends the run.
 			if stop := sc.app.ProcessError(fmt.Errorf("%s line %d: %w", sc.FromCSV, row.line, err)); stop != nil {
@@ -186,11 +202,14 @@ func (sc *swapCmd) runPlan(ctx context.Context) error {
 		}
 	}
 
-	done, failed := 0, 0
+	done, skipped, failed := 0, 0, 0
 	for _, r := range results {
-		if r.err != nil {
+		switch {
+		case r.err != nil:
 			failed++
-		} else {
+		case r.skipped != "":
+			skipped++
+		default:
 			done++
 		}
 	}
@@ -198,7 +217,8 @@ func (sc *swapCmd) runPlan(ctx context.Context) error {
 	if sc.trashSource {
 		verb = "replaced"
 	}
-	log.Message("%d asset(s) %s, %d failed, %d not attempted", done, verb, failed, len(rows)-len(results))
+	log.Message("%d asset(s) %s, %d skipped, %d failed, %d not attempted",
+		done, verb, skipped, failed, len(rows)-len(results))
 
 	if sc.Result != "" {
 		if err = writeResults(sc.Result, results); err != nil {
@@ -216,20 +236,26 @@ func (sc *swapCmd) checkPlan(ctx context.Context, rows []*planRow) error {
 	problems := []string{}
 
 	for _, row := range rows {
-		if err := checkFile(row.file, sm); err != nil {
-			problems = append(problems, fmt.Sprintf("line %d: %v", row.line, err))
-			continue
-		}
-
 		source, err := sc.client.Immich.GetAssetInfo(ctx, row.assetID)
 		if err != nil {
 			problems = append(problems, fmt.Sprintf("line %d: can't get the asset %s: %v", row.line, row.assetID, err))
 			continue
 		}
+
+		// Whether the row still needs work is decided before the file is looked at:
+		// a row that was applied already may well have had its converted file
+		// cleaned up since, and that must not hold the rest of the plan back.
 		if source.IsTrashed {
-			problems = append(problems, fmt.Sprintf("line %d: the asset %s is in the trash", row.line, row.assetID))
+			row.source = source
+			row.skip = "the source asset is in the trash, it was most likely replaced already"
 			continue
 		}
+
+		if err = checkFile(row.file, sm); err != nil {
+			problems = append(problems, fmt.Sprintf("line %d: %v", row.line, err))
+			continue
+		}
+
 		source.Albums, err = sc.client.Immich.GetAssetAlbums(ctx, source.ID)
 		if err != nil {
 			problems = append(problems, fmt.Sprintf("line %d: can't get the albums of %s: %v", row.line, row.assetID, err))
@@ -250,20 +276,37 @@ func (sc *swapCmd) reportPlan(rows []*planRow) {
 	var b strings.Builder
 	w := tabwriter.NewWriter(&b, 0, 0, 2, ' ', 0)
 	fmt.Fprintln(w, "#\tID\tCURRENT NAME\tNEW FILE")
+	todo := 0
 	for i, row := range rows {
-		fmt.Fprintf(w, "%d\t%s\t%s\t%s\n", i+1, row.assetID, row.source.OriginalFileName, row.file)
+		newFile := row.file
+		if row.skip != "" {
+			newFile = "(skipped: " + row.skip + ")"
+		} else {
+			todo++
+		}
+		fmt.Fprintf(w, "%d\t%s\t%s\t%s\n", i+1, row.assetID, row.source.OriginalFileName, newFile)
 	}
 	_ = w.Flush()
 	for line := range strings.SplitSeq(strings.TrimRight(b.String(), "\n"), "\n") {
 		log.Message("%s", line)
 	}
 
+	skipped := len(rows) - todo
 	if sc.trashSource {
-		log.Message("%d asset(s) to replace, the source of each one goes to the trash.", len(rows))
+		log.Message("%d asset(s) to replace, %d skipped. The source of each replaced one goes to the trash.", todo, skipped)
 	} else {
-		log.Message("%d asset(s) to clone, every source is left untouched.", len(rows))
+		log.Message("%d asset(s) to clone, %d skipped. Every source is left untouched.", todo, skipped)
 	}
 }
+
+// nothingToDo marks a row that needs nothing done to it. Re-running a plan that was
+// applied in part is the normal way to finish it, so in a plan this is a skip. On a
+// single asset the caller asked for something precise, and gets told it didn't happen.
+type nothingToDo struct {
+	reason string
+}
+
+func (e nothingToDo) Error() string { return e.reason }
 
 // processOne uploads fileName in place of source. detailed asks for the full
 // metadata block, which is worth printing for a single asset but not for a plan of
@@ -293,9 +336,9 @@ func (sc *swapCmd) processOne(ctx context.Context, source *immich.Asset, fileNam
 	}
 	for _, other := range onServer {
 		if other.ID == source.ID {
-			return "", fmt.Errorf("%s is the file of the asset %s already, nothing to do", fileName, source.ID)
+			return "", nothingToDo{fmt.Sprintf("%s is the file of the asset %s already", fileName, source.ID)}
 		}
-		return "", fmt.Errorf("%s is already on the server as the asset %s (%s)", fileName, other.ID, other.OriginalFileName)
+		return other.ID, nothingToDo{fmt.Sprintf("%s is already on the server as the asset %s (%s)", fileName, other.ID, other.OriginalFileName)}
 	}
 
 	if err = sc.swap(ctx, source, newAsset); err != nil {

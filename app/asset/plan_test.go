@@ -2,6 +2,8 @@ package asset
 
 import (
 	"encoding/csv"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -99,6 +101,7 @@ func TestWriteResults(t *testing.T) {
 	results := []planResult{
 		{row: &planRow{assetID: "aaa", file: "/out/a.mp4"}, newID: "new-aaa"},
 		{row: &planRow{assetID: "bbb", file: "/out/b.mp4"}, err: os.ErrNotExist},
+		{row: &planRow{assetID: "ccc", file: "/out/c.mp4"}, newID: "ccc-new", skipped: "already done"},
 	}
 	if err := writeResults(path, results); err != nil {
 		t.Fatalf("writeResults: %v", err)
@@ -113,14 +116,17 @@ func TestWriteResults(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read: %v", err)
 	}
-	if len(records) != 3 {
-		t.Fatalf("got %d records, want a header and two rows", len(records))
+	if len(records) != 4 {
+		t.Fatalf("got %d records, want a header and three rows", len(records))
 	}
 	if got, want := records[1], []string{"aaa", "new-aaa", "/out/a.mp4", "ok", ""}; !equal(got, want) {
 		t.Errorf("got %v, want %v", got, want)
 	}
 	if records[2][3] != "failed" || records[2][4] == "" {
 		t.Errorf("the failed row lost its status or message: %v", records[2])
+	}
+	if records[3][3] != "skipped" || records[3][4] != "already done" {
+		t.Errorf("the skipped row lost its status or reason: %v", records[3])
 	}
 
 	// A previous record of what happened must not be overwritten.
@@ -139,4 +145,25 @@ func equal(a, b []string) bool {
 		}
 	}
 	return true
+}
+
+// A row that needs nothing done is reported as a skip, not as a failure, so that a
+// plan re-run after a partial one doesn't stop on --on-errors=stop.
+func TestNothingToDoIsNotAPlainError(t *testing.T) {
+	var err error = nothingToDo{"already on the server"}
+
+	var target nothingToDo
+	if !errors.As(err, &target) {
+		t.Fatal("nothingToDo is not recognised by errors.As")
+	}
+	if target.reason != "already on the server" {
+		t.Errorf("reason = %q", target.reason)
+	}
+	if err.Error() != "already on the server" {
+		t.Errorf("Error() = %q", err.Error())
+	}
+	// A wrapped one must still be recognised, errors travel up through fmt.Errorf.
+	if !errors.As(fmt.Errorf("line 4: %w", err), &target) {
+		t.Error("a wrapped nothingToDo is not recognised")
+	}
 }
